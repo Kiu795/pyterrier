@@ -1,15 +1,20 @@
 # from concurrent.futures import ThreadPoolExecutor
 import pyterrier as pt
+import os
 import pyterrier_alpha as pta
 import pandas as pd
 from typing import List, Optional
 import re
 from pyterrier_rag import HuggingFaceBackend
 import torch
-from transformers import AutoTokenizer
-# from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import transformers
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+try:
+    from vllm import LLM, SamplingParams
+    _VLLM_OK = True
+except Exception:
+    _VLLM_OK = False
 
 
 
@@ -141,8 +146,12 @@ class AgenticRAG(pt.Transformer):
             # 4. 执行批量检索
             #4. exectute queries
             # all_results = (self.retriever % self.top_k)(batch_queries)
+            df_search = pd.DataFrame({
+                "qid": list(range(len(pending_search_str))),
+                "query": pending_search_str
+            })
             if pending_search_str:
-                all_results = (self.retriever % self.top_k).search(pending_search_str)
+                all_results = (self.retriever % self.top_k).search(df_search)
             else:
                 all_results = []
             # replace state_active_queries with pending_queries
@@ -163,54 +172,6 @@ class AgenticRAG(pt.Transformer):
         # combine state_finished into results_df, and anything left in state_active that
         results = state_finished_queries + state_active_queries
         return pd.DataFrame(results)
-
-    # def transform_backup(self, df: pd.DataFrame) -> pd.DataFrame:
-    #     state_active_queries = []
-    #     for _, row in df.iterrows():
-    #         state = {
-    #             'qid': row['qid'],
-    #             'query': row['query'],
-    #             'context': self.prompt.format(question=row["query"]) if self.prompt else row["query"],
-    #             'search_history': [],
-    #         }
-    #         state_active_queries.append(state)
-    #     state_finished_queries = []
-    #     for turn in range(self.max_turn):
-    #         outputs = self.generate([q['context'] for q in state_active_queries])
-    #         batch_answers = self.check_answers(outputs)
-    #         batch_querying = []
-    #         batch_queries = []
-    #         for i, answer in enumerate(batch_answers):
-    #             if answer is not None:
-    #                 finished_query = state_active_queries[i]
-    #                 finished_query['qanswer'] = answer
-    #                 finished_query['output'] = outputs[i]
-    #                 state_finished_queries.append(finished_query)
-    #             else:
-    #                 batch_querying.append(state_active_queries[i])
-    #                 batch_queries.append(self.get_search_query(outputs[i]))
-    #         for i, q in enumerate(batch_querying):
-    #             if batch_queries[i] is None or batch_queries[i] == "":
-    #                 q['qanswer'] = None
-    #                 q['output'] = outputs[i]
-    #                 q['error'] = "No answer and no retrieval request"
-    #                 state_finished_queries.append(q)
-    #         batch_querying = [q for i, q in enumerate(batch_querying) if batch_queries[i] is not None and batch_queries[i] != ""]
-    #         batch_queries = [q for q in batch_queries if q is not None and q != ""]
-    #         if batch_queries:
-    #             all_results = (self.retriever % self.top_k).search(batch_queries)
-    #         else:
-    #             all_results = []
-    #         for i, q in enumerate(batch_querying):
-    #             if batch_queries:
-    #                 docs_str = self.format_docs(all_results[i]) if len(all_results) > i else ""
-    #                 q['context'] += self.wrap_search_results(docs_str)
-    #                 q['search_history'].append(batch_queries[i])
-    #         state_active_queries = batch_querying
-    #         if not state_active_queries:
-    #             break
-    #     results = state_finished_queries + state_active_queries
-    #     return pd.DataFrame(results)
     
     def check_answers(self, model_outputs: List[str]) -> List[str]:
         results = []
@@ -247,18 +208,6 @@ class AgenticRAG(pt.Transformer):
             "history": history,
             "answer": self.format_answers(output)
         }
-
-    # same as the last one, not tested, just for concepts preparation
-    # def parallel_transform(self, df: pd.DataFrame) -> pd.DataFrame:
-
-    #     # 并行处理所有输入样本，每个样本调用 self.transform_one(row)。
-    #     # 返回所有结果组成的 DataFrame。
-    #     results = []
-    #     with ThreadPoolExecutor() as executor:
-    #         futures = [executor.submit(self.transform_one, row) for _, row in df.iterrows()]
-    #         for future in as_completed(futures):
-    #             results.append(future.result())
-    #     return pd.DataFrame(results)
 
     # get prompt
     def get_prompt(self, context:str):
@@ -300,14 +249,35 @@ class AgenticRAG(pt.Transformer):
 
     # 格式化检索文档
     def format_docs(self, docs: pd.DataFrame):
+        if docs is None or len(docs) == 0:
+            return ""
         return "\n".join([doc["text"] for doc in docs])
+    # 常见文本列兜底
+        # cand = [c for c in ["text", "body", "raw", "contents", "title"] if c in docs.columns]
+        # lines = []
+        # if cand:
+        #     col = cand[0]
+        #     for _, row in docs.iterrows():
+        #         txt = str(row.get(col, "")).strip()
+        #         if txt:
+        #             lines.append(txt)
+        # else:
+        #     # 没有文本列时，输出 docno/score 等用于排查
+        #     for _, row in docs.iterrows():
+        #         parts = []
+        #         for c in ["docno", "docid", "rank", "score"]:
+        #             if c in docs.columns:
+        #                 parts.append(f"{c}={row.get(c)}")
+        #         if parts:
+        #             lines.append(" | ".join(parts))
+        # return "\n---\n".join(lines[: self.top_k])
         
     # 包装检索结果
     def wrap_search_results(self, docs_str: str):
         return f"{self.start_results_tag}{docs_str}{self.end_results_tag}"
 
     # 格式化检索结果
-    def format_answers(output: str) -> str:
+    def format_answers(self, output: str) -> str:
 
         match = re.search(r"<answer>(.*?)</answer>", output, re.DOTALL)
         if match:
@@ -336,11 +306,8 @@ class AgenticRAG(pt.Transformer):
 
     #终止条件，子类实现
     def is_finished(self, output:str) -> bool:
-        
+        # 基于字符串的简单完成判断
         if "<answer>" in output:
-        # 如果需要严格匹配 stop_reason
-            if output.outputs[0].stop_reason:
-                return output.outputs[0].stop_reason.strip() == "</answer>"
             return True
         
         if re.search(r"\\boxed\{.*?\}", output):
@@ -448,43 +415,83 @@ class R1Searcher(AgenticRAG):
     # v1: 多步/子问题推理，问题会被拆分为子问题，每个子问题用 <|begin_of_query|>kw1\tkw2<|end_of_query|> 检索，关键词用制表符分隔，适合多跳/复杂问答。
     # v2: 多步推理+关键词检索，检索query只允许关键词列表（用\t分隔），不允许完整句子，适合只用关键词检索的场景。
     # v3: 判断类推理，专为yes/no问题设计，推理后答案必须是yes或no，检索方式同v0，适合判断类问答。
-    def __init__(self,
-        retriever, 
-        generator = None,
-        temperature = 0.7,
-        top_k = 5,
-        top_p = 0.95,
-        max_turn = 10,
-        max_tokens = 512,
-        model_id = "XXsongLALA/Qwen-2.5-7B-base-RAG-RL",
-        model_kw_args = {'tensor_parallel_size' : 1, 'gpu_memory_utilization' : 0.95},
-        prompt_type = 'v1', #prompt for the agent
-        verbose = False,
-        **kwargs
-    ):
-        super().__init__(
-            retriever = retriever,
-            generator = generator,
-            prompt = self.get_prompt(prompt_type),
-            temperature = temperature,
-            top_k = top_k,
-            top_p = top_p,
-            max_turn = max_turn,
-            model_id = model_id,
-            tokenizer = AutoTokenizer.from_pretrained(model_id),
-            max_tokens = max_tokens,
-            model_kw_args=model_kw_args,
-            start_search_tag="<|begin_of_query|>",
-            end_search_tag="<|end_of_query|>",
-            start_results_tag="<|begin_of_documents|>",
-            end_results_tag="<|end_of_documents|>",
-            **kwargs
-        )
-        self.prompt_type = prompt_type
+    def __init__(self, 
+             retriever,
+             generator=None,
+             temperature=0.7,
+             top_k=5,
+             top_p=0.95,
+             max_turn=6,
+             max_tokens=512,
+             model_id="XXsongLALA/Qwen-2.5-7B-base-RAG-RL",   # 建议先用公开模型
+             model_kw_args=None,
+             prompt_type=None,
+             verbose=True,
+             use_vllm=True,                         # 需要时可在实例化时传 False 直接走 transformers
+             hf_token=None,
+             **kwargs):
+        # 父类里不再用 model_id 初始化生成后端；由本类接管
+        super().__init__(retriever=retriever, generator=None, temperature=temperature,
+                         top_k=top_k, top_p=top_p, max_turn=max_turn,
+                         max_tokens=max_tokens, model_id=None, model_kw_args={})
+        # 基础配置与提示/标记
+        self.max_tokens = max_tokens
         self.verbose = verbose
-        from vllm import LLM, SamplingParams
-        self.llm = LLM(model=model_id, trust_remote_code=True, **model_kw_args)
-        self.sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+        self.model_id = model_id
+        self.hf_token = hf_token or os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+        self._backend = None   # "vllm" | "hf"
+        self.tokenizer = None
+        self.device = None
+        self.prompt_type = prompt_type
+        self.prompt = self.get_prompt(prompt_type) if prompt_type else None
+        self.start_search_tag = "<|begin_of_query|>"
+        self.end_search_tag = "<|end_of_query|>"
+        self.start_results_tag = "<|begin_of_documents|>"
+        self.end_results_tag = "<|end_of_documents|>"
+
+        # —— 优先尝试 vLLM（更快），失败自动回退 ——
+        if use_vllm and _VLLM_OK:
+            try:
+                # 多进程与日志的稳态设置（notebook/本地更稳）
+                os.environ.setdefault("VLLM_WORKER_MULTIPROCESSING_METHOD", "spawn")
+                os.environ.setdefault("VLLM_USE_V1", "0")      # 如需 v1 再改回 "1"
+                os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
+
+                mk = dict(
+                    trust_remote_code=True,
+                    hf_token=self.hf_token,
+                    dtype="bfloat16",                 # 或 "float16"
+                    tensor_parallel_size=1,
+                    gpu_memory_utilization=0.65,      # 降预分配，减少 Engine 启动失败
+                    max_model_len=2048,               # 降 KV cache 预分配
+                    enforce_eager=True,               # 初始化更稳
+                )
+                if model_kw_args:
+                    mk.update(model_kw_args)
+
+                self.llm = LLM(model=self.model_id, **mk)
+                self.sampling_params = SamplingParams(
+                    temperature=temperature, top_p=top_p, max_tokens=max_tokens
+                )
+                self._backend = "vllm"
+                if self.verbose:
+                    print(f"[R1Searcher] vLLM backend ready: {self.model_id}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"[R1Searcher] vLLM init failed, fallback to transformers: {e}")
+
+        # —— 回退：transformers（最稳的保底路径） ——
+        if self._backend is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, token=self.hf_token, use_fast=True)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.model_id, token=self.hf_token, torch_dtype="auto", device_map="auto"
+            )
+            self.device = next(self.llm.parameters()).device
+            self._backend = "hf"
+            if self.verbose:
+                print(f"[R1Searcher] transformers backend ready: {self.model_id} on {self.device}")
 
     def get_prompt(self, prompt_type:str):
         if prompt_type == 'v0':
@@ -519,9 +526,48 @@ Assistant: <think>"""
         elif prompt_type == 'v3':
             return """The User asks a **Judgment question**, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer. The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here (yes or no) </answer>". During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only keywords) here <|end_of_query|>". Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>". The final answer **must be yes or no**.\n\nUser:{question}\nAssistant: <think>"""
 
-    def generate(self, context:str) -> str:
-        output = self.llm.generate([context], self.sampling_params, use_tqdm = self.verbose)[0]
-        return output.outputs[0].text
+    def generate(self, contexts: List[str]) -> List[str]:
+        # vLLM 后端：原生支持批量
+        if self._backend == "vllm":
+            outputs = self.llm.generate(contexts, self.sampling_params, use_tqdm=self.verbose)
+            return [o.outputs[0].text for o in outputs]
+
+        # transformers 回退：批量 tokenize 与生成
+        assert self.tokenizer is not None and self.device is not None, "HF backend not initialized"
+        encoded = self.tokenizer(
+            contexts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            add_special_tokens=True,
+        )
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        with torch.no_grad():
+            generated = self.llm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                do_sample=True,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                max_new_tokens=self.max_tokens or 512,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # 仅解码新生成段，按每条样本原始长度裁切
+        if attention_mask is None:
+            prompt_lengths = [input_ids.shape[1]] * input_ids.shape[0]
+        else:
+            prompt_lengths = attention_mask.sum(dim=1).tolist()
+
+        texts: List[str] = []
+        for i in range(generated.size(0)):
+            new_tokens = generated[i, prompt_lengths[i]:]
+            texts.append(self.tokenizer.decode(new_tokens, skip_special_tokens=True))
+        return texts
 
 # class O1Analyser(pt.Transformer):
     
