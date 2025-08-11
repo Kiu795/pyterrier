@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pyterrier as pt
 import pyterrier_alpha as pta
 import pandas as pd
-from typing import List
+from typing import List, Optional
 import re
 from pyterrier_rag import HuggingFaceBackend
 import torch
@@ -121,16 +121,22 @@ class AgenticRAG(pt.Transformer):
 
             #3. check for retrieve requirements in each of the outputs
             # build up BATCH of queries (df) to execute
-            #3a. check for outputs with no ansewr and no retrieval - that is error condition
+            #3a. check for outputs with no answer and no retrieval - that is error condition
+            next_pending_queries = []
+            next_pending_search_str = []
             for i, q in enumerate(pending_queries):
-                if pending_search_str[i] is None or pending_search_str[i] == "":
+                s = pending_search_str[i]
+                if s is None:
                     # 标记为异常，直接结束
                     q['qanswer'] = None
                     q['output'] = None
                     state_finished_queries.append(q)
+                else:
+                    next_pending_queries.append(q)
+                    next_pending_search_str.append(s)
             # 只保留需要检索的
-            pending_queries = [q for i, q in enumerate(pending_queries) if pending_search_str[i] is not None and pending_search_str[i] != ""]
-            pending_search_str = [q for q in pending_search_str if q is not None and q != ""]
+            pending_queries = next_pending_queries
+            pending_search_str = next_pending_search_str
 
             # 4. 执行批量检索
             #4. exectute queries
@@ -262,10 +268,35 @@ class AgenticRAG(pt.Transformer):
         raise NotImplementedError
         
     #get search query from the output, can be similar among different models
-    def get_search_query(self, output:str) -> str:
-        query = output.split(self.start_search_tag)[1].split(self.end_search_tag)[0]
-        query = query.replace('"',"").replace("'","").replace("\t"," ").replace("...","")
-        return query
+    def get_search_query(self, output: str) -> Optional[str]:
+        if output is None:
+            return None
+        start_tag = self.start_search_tag
+        end_tag = self.end_search_tag
+
+        start_idx = output.find(start_tag)
+        if start_idx == -1:
+            return None
+        start_idx += len(start_tag)
+        end_idx = output.find(end_tag, start_idx)
+        if end_idx == -1:
+            return None
+
+        query = output[start_idx:end_idx].strip()
+        if not query:
+            return None
+
+        query = (
+            query.replace('"', "")
+                 .replace("'", "")
+                 .replace("\t", " ")
+                 .replace("...", "")
+                 .strip()
+        )
+
+        # 规范化空白
+        query = re.sub(r"\s+", " ", query) if query else ""
+        return query if query else None
 
     # 格式化检索文档
     def format_docs(self, docs: pd.DataFrame):
