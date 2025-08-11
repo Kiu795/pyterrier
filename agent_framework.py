@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+# from concurrent.futures import ThreadPoolExecutor
 import pyterrier as pt
 import pyterrier_alpha as pta
 import pandas as pd
@@ -7,7 +7,7 @@ import re
 from pyterrier_rag import HuggingFaceBackend
 import torch
 from transformers import AutoTokenizer
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import transformers
 
@@ -249,16 +249,16 @@ class AgenticRAG(pt.Transformer):
         }
 
     # same as the last one, not tested, just for concepts preparation
-    def parallel_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    # def parallel_transform(self, df: pd.DataFrame) -> pd.DataFrame:
 
-        # 并行处理所有输入样本，每个样本调用 self.transform_one(row)。
-        # 返回所有结果组成的 DataFrame。
-        results = []
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(self.transform_one, row) for _, row in df.iterrows()]
-            for future in as_completed(futures):
-                results.append(future.result())
-        return pd.DataFrame(results)
+    #     # 并行处理所有输入样本，每个样本调用 self.transform_one(row)。
+    #     # 返回所有结果组成的 DataFrame。
+    #     results = []
+    #     with ThreadPoolExecutor() as executor:
+    #         futures = [executor.submit(self.transform_one, row) for _, row in df.iterrows()]
+    #         for future in as_completed(futures):
+    #             results.append(future.result())
+    #     return pd.DataFrame(results)
 
     # get prompt
     def get_prompt(self, context:str):
