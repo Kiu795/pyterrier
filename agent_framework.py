@@ -9,6 +9,7 @@ from pyterrier_rag import HuggingFaceBackend
 import torch
 import transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import List, Dict, Any
 
 try:
     from vllm import LLM, SamplingParams
@@ -24,7 +25,7 @@ class AgenticRAG(pt.Transformer):
         self,
         retriever : pt.Transformer, 
         generator :None, #HuggingFaceBackend when using o1, None when using r1
-        prompt:str = None,
+        prompt:str = "{question}",
         temperature:float = 0.7,
         top_k:int = 5,
         top_p:float = 0.95,
@@ -67,6 +68,7 @@ class AgenticRAG(pt.Transformer):
         self.top_p = top_p
         self.max_turn = max_turn
         self.model_id = model_id
+        self.max_tokens = max_tokens
         self.tokenizer = tokenizer
         self.model_kw_args = model_kw_args if model_kw_args else {}
         self.kwargs = kwargs
@@ -85,91 +87,102 @@ class AgenticRAG(pt.Transformer):
         # BACKUP　plan
         #return pd.concat([self.transform_one(query_df) for query_df in ])
         
-        state_active_queries = []
+        state_active_queries : List[Dict[str,Any]] = []
         for _, row in df.iterrows():
             state = {
-                'qid': row['qid'],
+                'qid': str(row['qid']),
                 'query': row['query'],
                 'context': self.prompt.format(question=row["query"]) if self.prompt else row["query"],
                 'search_history': [],
+                'search_iterations' : 0,
+                'qanswer' : None,
+                'output' : '',
+                'stop_reason' : None,
             }
             state_active_queries.append(state)
-        state_finished_queries = []
+        state_finished_queries : List[Dict[str,Any]] = []
 
         for turn in range(self.max_turn):
+            # print(turn)
             if not state_active_queries:
                 break
-            #1. call the LLM for each query still active
-            # outputs = self.generate([q['context'] for q in state_active_queries])
 
             # 1. 批量调用LLM生成
-            outputs = self.generate([q['context'] for q in state_active_queries])  # outputs: List[str]
+            #1. call the LLM for each query still active
+
+            outputs : List[str] = self.generate([q['context'] for q in state_active_queries])  # outputs: List[str]
             #2. check for answer in each of the :
             # if we see the question has been answered:
                 # extract the answer
                 # remove this query from state_active, add to state_finished list
             # 2. 检查每个输出是否已经有答案
             # 这里的batch_answers是使用check_answers方法提取出的列表，带有序号
-            batch_answers = self.check_answers(outputs)  # List[answer or None]
-            pending_queries = []
-            pending_search_str = []
-            pending_outputs = []
-            for i, answer in enumerate(batch_answers):
-                if answer is not None:
-                    finished_query = state_active_queries[i]
-                    finished_query['qanswer'] = answer
-                    finished_query['output'] = outputs[i]
-                    state_finished_queries.append(finished_query)
-                else:
-                #如果还没有答案，则需要检索。
-                    pending_queries.append(state_active_queries[i])
-                    pending_search_str.append(self.get_search_query(outputs[i]))  # 提取检索query
-                    pending_outputs.append(outputs[i])
+            batch_answers : List[str|None] = self.check_answers(outputs)  # List[answer or None]
+            # one for every active query
+            assert len(batch_answers) == len(state_active_queries)
+            pending_queries : List[Dict[str,Any]] = []
 
-            #3. check for retrieve requirements in each of the outputs
-            # build up BATCH of queries (df) to execute
-            #3a. check for outputs with no answer and no retrieval - that is error condition
-            next_pending_queries = []
-            next_pending_search_str = []
-            for i, q in enumerate(pending_queries):
-                s = pending_search_str[i]
-                if s is None:
-                    # 无检索标签但有文本输出时，将原文作为候选答案保留
-                    original_output = pending_outputs[i] if i < len(pending_outputs) else None
-                    q['output'] = original_output
-                    q['qanswer'] = original_output
-                    state_finished_queries.append(q)
+            for i, answer in enumerate(batch_answers):
+                # print(i)
+                this_query_state = state_active_queries[i]
+                this_query_state['output'] += outputs[i]
+                next_search = self.get_search_query(outputs[i])
+
+                if answer != "no answer found":
+                    this_query_state['qanswer'] = answer
+                    this_query_state['stop_reason'] = 'Got answer'
+                    state_finished_queries.append(this_query_state)
+                    
+
                 else:
-                    next_pending_queries.append(q)
-                    next_pending_search_str.append(s)
-            # 只保留需要检索的
-            pending_queries = next_pending_queries
-            pending_search_str = next_pending_search_str
+                    if not next_search:
+                        # todo - use the output as the backup answer?
+                        this_query_state['stop_reason'] = 'No answer, no search'
+                        state_finished_queries.append(this_query_state)
+                        continue
+
+                    else:
+                        
+                        this_query_state['search_history'].append(next_search)  # 提取检索query
+                        this_query_state['search_iterations'] += 1  
+                        pending_queries.append(this_query_state)
+
+            state_active_queries = pending_queries
+
+            if len(pending_queries) == 0:
+                break
 
             # 4. 执行批量检索
             #4. exectute queries
             # all_results = (self.retriever % self.top_k)(batch_queries)
-            df_search = pd.DataFrame({
-                "qid": list(range(len(pending_search_str))),
-                "query": pending_search_str
+            batch_queries = pd.DataFrame({
+                "qid": [ f"{q['qid']}-{len(q['search_history'])}"  for q in pending_queries ],
+                "query": [ q['search_history'][-1] for q in pending_queries ]
             })
-            if pending_search_str:
-                all_results = (self.retriever % self.top_k).search(df_search)
-            else:
-                all_results = []
+
+            # batch_queries["qid"] = batch_queries["qid"].astype(str)
+            batch_results = (self.retriever % self.top_k).transform(batch_queries)
+            
             # replace state_active_queries with pending_queries
             # 5. 将检索结果加入到下轮context
+            next_state_active_queries = []
             for i, q in enumerate(pending_queries):
-                if pending_search_str:
-                    docs_str = self.format_docs(all_results[i]) if len(all_results) > i else ""
+                batch_results["qid"] = batch_results["qid"].astype(str)
+                this_q_results = batch_results[batch_results.qid.str.startswith(q['qid'] + "-")]
+                if len(this_q_results):
+                    docs_str = self.format_docs(this_q_results)
                     q['context'] += self.wrap_search_results(docs_str)
-                    q['search_history'].append(pending_search_str[i])
-            state_active_queries = pending_queries
+                    next_state_active_queries.append(q)
+                else:
+                    q['stop_reason'] = 'No retrieval results'
+                    state_finished_queries.append(q)
+                    continue
 
-            # 6. if no queries left in state_active, then break
-            # 6. 如果没有剩余active，提前结束
-            if not state_active_queries:
-                break
+            state_active_queries = next_state_active_queries
+
+            # # any still active queries must have had no answer after self.max_turns    
+            for q in state_active_queries:
+                q["stop_reason"] = 'No answer after max turns'
 
         # 7. 合并所有已完成的和剩余未完成的
         # combine state_finished into results_df, and anything left in state_active that
@@ -179,7 +192,7 @@ class AgenticRAG(pt.Transformer):
     def check_answers(self, model_outputs: List[str]) -> List[str]:
         results = []
         for output in model_outputs:
-            answer = self.format_answers(output)
+            answer = self.format_answers(output, strict=True)
             if answer == "no answer found":
                 results.append(None)
             else:
@@ -211,10 +224,6 @@ class AgenticRAG(pt.Transformer):
             "history": history,
             "answer": self.format_answers(output)
         }
-
-    # get prompt
-    def get_prompt(self, context:str):
-        raise NotImplementedError
 
     def generate(self, context:List[str]) -> List[str]: 
         raise NotImplementedError
@@ -249,38 +258,37 @@ class AgenticRAG(pt.Transformer):
         # 规范化空白
         query = re.sub(r"\s+", " ", query) if query else ""
         return query if query else None
-
-    # 格式化检索文档
-    def format_docs(self, docs: pd.DataFrame):
-        if docs is None or len(docs) == 0:
+    
+    def format_docs(self, docs: pd.DataFrame) -> str:
+    # 空值兜底
+        if docs is None:
             return ""
-        return "\n".join([doc["text"] for doc in docs])
-    # 常见文本列兜底
-        # cand = [c for c in ["text", "body", "raw", "contents", "title"] if c in docs.columns]
-        # lines = []
-        # if cand:
-        #     col = cand[0]
-        #     for _, row in docs.iterrows():
-        #         txt = str(row.get(col, "")).strip()
-        #         if txt:
-        #             lines.append(txt)
-        # else:
-        #     # 没有文本列时，输出 docno/score 等用于排查
-        #     for _, row in docs.iterrows():
-        #         parts = []
-        #         for c in ["docno", "docid", "rank", "score"]:
-        #             if c in docs.columns:
-        #                 parts.append(f"{c}={row.get(c)}")
-        #         if parts:
-        #             lines.append(" | ".join(parts))
-        # return "\n---\n".join(lines[: self.top_k])
+
+        # 如果是 DataFrame
+        if isinstance(docs, pd.DataFrame):
+            if len(docs) == 0:
+                return ""
+            # 优先常见文本列
+            for col in ["text", "body", "raw", "contents", "title"]:
+                if col in docs.columns:
+                    return "\n".join(docs[col].astype(str).tolist())
+            # 没有文本列时，拼一些可读字段便于排查
+            meta_cols = [c for c in ["docno", "docid", "rank", "score"] if c in docs.columns]
+            if meta_cols:
+                return "\n".join(
+                    docs[meta_cols].astype(str).agg(" | ".join, axis=1).tolist()
+                )
+            # 实在没有就返回整行字符串
+            return "\n".join(docs.astype(str).agg(" | ".join, axis=1).tolist())
+
+
         
     # 包装检索结果
     def wrap_search_results(self, docs_str: str):
         return f"{self.start_results_tag}{docs_str}{self.end_results_tag}"
 
     # 格式化检索结果
-    def format_answers(self, output: str) -> str:
+    def format_answers(self, output: str, strict: bool = False) -> str:
         # 1) 显式 <answer> 标签
         match = re.search(r"<answer>(.*?)</answer>", output, re.DOTALL)
         if match:
@@ -300,9 +308,9 @@ class AgenticRAG(pt.Transformer):
 
         # 3) 英/中 Final Answer/答案 提示样式（大小写、空格、冒号兼容）
         patterns = [
-            r"(?i)final\s*answer\s*[:：]\s*(.+)",
-            r"(?i)answer\s*[:：]\s*(.+)",
-            r"(?:最终答案|答案)\s*[:：]\s*(.+)",
+            r"(?i)final\s*answer\s*[:]\s*(.+)",
+            r"(?i)answer\s*[:]\s*(.+)",
+            r"(?:最终答案|答案)\s*[:]\s*(.+)",
         ]
         for p in patterns:
             m = re.search(p, output, flags=re.IGNORECASE | re.DOTALL)
@@ -314,19 +322,20 @@ class AgenticRAG(pt.Transformer):
                         return sentence
 
         # 4) 有思考标签时，取 </think> 之后首句作为兜底
-        if "</think>" in output:
-            after_think = output.split("</think>", 1)[1].strip()
-            if after_think:
-                sentence = re.split(r"[\n。!?\.]", after_think, maxsplit=1)[0].strip()
+        if not strict:
+            if "</think>" in output:
+                after_think = output.split("</think>", 1)[1].strip()
+                if after_think:
+                    sentence = re.split(r"[\n。!?\.]", after_think, maxsplit=1)[0].strip()
+                    if sentence:
+                        return sentence
+
+            # 5) 纯文本兜底：取首个非空行/首句
+            clean = (output or "").strip()
+            if clean:
+                sentence = re.split(r"[\n。!?\.]", clean, maxsplit=1)[0].strip()
                 if sentence:
                     return sentence
-
-        # 5) 纯文本兜底：取首个非空行/首句
-        clean = (output or "").strip()
-        if clean:
-            sentence = re.split(r"[\n。!?\.]", clean, maxsplit=1)[0].strip()
-            if sentence:
-                return sentence
 
         return "no answer found"
 
@@ -386,7 +395,7 @@ class SearchR1(AgenticRAG):
         super().__init__(
             retriever = retriever,
             generator = generator,
-            prompt = self.get_prompt(),
+            prompt = self._get_prompt(),
             temperature = temperature,
             top_k = top_k,
             max_turn = max_turn,
@@ -400,16 +409,21 @@ class SearchR1(AgenticRAG):
             **kwargs
         )
 
+        # 确保 tokenizer 具备 pad_token，避免批量 padding 或 generate 报错
+        if self.tokenizer.pad_token is None:
+            # 保证批量 padding 可用，且 HF generate() 不会报错
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-        target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n"]
-        self.stopping_criteria = transformers.StoppingCriteriaList([StopOnSequence(target_sequences, self.tokenizer)])
+        self.target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n"]
+        self.stopping_criteria = transformers.StoppingCriteriaList([StopOnSequence(self.target_sequences, self.tokenizer)])
         self.curr_eos = self.tokenizer.convert_tokens_to_ids([self.tokenizer.eos_token, "<|im_end|>"]) #[151645, 151643] # for Qwen2.5 series models
         self.retrieval_top_k = top_k
 
         self.llm = transformers.AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
     
-    def get_prompt(self):
+    def _get_prompt(self):
         prompt = """Answer the given question. \
 You must conduct reasoning inside <think> and </think> first every time you get new information. \
 After reasoning, if you find you lack some knowledge, you can call a search engine by <search> query </search> and it will return the top searched results between <information> and </information>. \
@@ -419,29 +433,53 @@ User:{question}
 Assistant: <think>"""
         return prompt
 
-    def generate(self, contexts:List[str]) -> List[str]:
-        input_ids = self.tokenizer.encode(contexts, return_tensors='pt').to(self.device)
-        attention_mask = torch.ones_like(input_ids)
-        prompt_length = input_ids.shape[-1] 
-        token_ids = self.llm.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=1024,
-            stopping_criteria=self.stopping_criteria,
-            pad_token_id=self.tokenizer.eos_token_id,
-            do_sample=True,
-            temperature=self.temperature
+    def generate(self, contexts: List[str]) -> List[str]:
+        """
+        批量生成：
+        - 使用 tokenizer 批量编码（padding + truncation）
+        - 生成时使用 stopping_criteria（在 __init__ 已设置）
+        - 只解码新增段（按每个样本的 prompt 长度裁切）
+        """
+        # 批量编码（注意：不能用 encode 处理 List[str]）
+        encoded = self.tokenizer(
+            contexts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            add_special_tokens=True,
         )
-        token_ids = token_ids[:, prompt_length:] 
-        return self.tokenizer.batch_decode(token_ids, skip_special_tokens=True)
-        
-        # #TODO　check what 0 is 
-        # if outputs[0][-1].item() in self.curr_eos:
-        #     generated_tokens = outputs[0][input_ids.shape[1]:]
-        #     output_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        #     return output_text
-        raise ValueError("no eos token found in %s", str(outputs))
-        #return outputs
+
+        # 送到设备
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        # 生成
+        with torch.no_grad():
+            outputs = self.llm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_tokens or 512,
+                do_sample=True,
+                temperature=self.temperature,
+                stopping_criteria=self.stopping_criteria,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # 仅保留“新生成”的 tokens：按每条样本的 prompt 实际长度裁切
+        if attention_mask is None:
+            prompt_lens = [input_ids.shape[1]] * input_ids.shape[0]
+        else:
+            # attention_mask 中 1 的数量即为有效 prompt 长度
+            prompt_lens = attention_mask.sum(dim=1).tolist()
+
+        texts: List[str] = []
+        for i in range(outputs.size(0)):
+            new_tokens = outputs[i, prompt_lens[i]:]
+            texts.append(self.tokenizer.decode(new_tokens, skip_special_tokens=True))
+
+        return texts
         
 class R1Searcher(AgenticRAG):
     # prompt_type 说明：
@@ -459,7 +497,7 @@ class R1Searcher(AgenticRAG):
              max_tokens=512,
              model_id="XXsongLALA/Qwen-2.5-7B-base-RAG-RL",   # 建议先用公开模型
              model_kw_args=None,
-             prompt_type=None,
+             prompt_type='v1',
              verbose=True,
              use_vllm=True,                         # 需要时可在实例化时传 False 直接走 transformers
              hf_token=None,
@@ -467,8 +505,11 @@ class R1Searcher(AgenticRAG):
         # 父类里不再用 model_id 初始化生成后端；由本类接管
         super().__init__(retriever=retriever, generator=None, temperature=temperature,
                          top_k=top_k, top_p=top_p, max_turn=max_turn,
-                         max_tokens=max_tokens, model_id=None, model_kw_args={})
-        # 基础配置与提示/标记
+                         max_tokens=max_tokens, model_id=None, model_kw_args={},
+                         prompt=self.get_prompt(prompt_type)
+                         )
+
+        
         self.max_tokens = max_tokens
         self.verbose = verbose
         self.model_id = model_id
@@ -477,11 +518,19 @@ class R1Searcher(AgenticRAG):
         self.tokenizer = None
         self.device = None
         self.prompt_type = prompt_type
-        self.prompt = self.get_prompt(prompt_type) if prompt_type else None
         self.start_search_tag = "<|begin_of_query|>"
         self.end_search_tag = "<|end_of_query|>"
         self.start_results_tag = "<|begin_of_documents|>"
         self.end_results_tag = "<|end_of_documents|>"
+
+        # 基础配置与提示/标记
+        # 与 R1Searcher 的查询标签一致（而非 </search>）
+        self.target_sequences = [
+            self.end_search_tag,   
+            " " + self.end_search_tag,         # 前面可能带空格
+            self.end_search_tag + "\n",
+            self.end_search_tag + "\n\n"
+        ]
 
         # —— 优先尝试 vLLM（更快），失败自动回退 ——
         if use_vllm and _VLLM_OK:
@@ -505,7 +554,8 @@ class R1Searcher(AgenticRAG):
 
                 self.llm = LLM(model=self.model_id, **mk)
                 self.sampling_params = SamplingParams(
-                    temperature=temperature, top_p=top_p, max_tokens=max_tokens
+                    temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+                    stop = ["<|im_end|>", self.end_search_tag, "<|endoftext|>", "</answer>"]
                 )
                 self._backend = "vllm"
                 if self.verbose:
@@ -526,6 +576,7 @@ class R1Searcher(AgenticRAG):
             self._backend = "hf"
             if self.verbose:
                 print(f"[R1Searcher] transformers backend ready: {self.model_id} on {self.device}")
+            self.stopping_criteria = transformers.StoppingCriteriaList([StopOnSequence(self.target_sequences, self.tokenizer)])
 
     def get_prompt(self, prompt_type:str):
         if prompt_type == 'v0':
@@ -533,8 +584,7 @@ class R1Searcher(AgenticRAG):
 The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer.
 The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here </answer>".
 During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only keywords) here <|end_of_query|>". **A query must involve only a single triple**.
-Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".
-When confident, reply with: "Final Answer: <answer>" only.\n\nUser:{question}\nAssistant: <think>"""
+Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".\n\nUser:{question}\nAssistant: <think>"""
 
         elif prompt_type == 'v1':
             return """The User asks a question, and the Assistant solves it.
@@ -544,7 +594,6 @@ During the reasoning process, the Assistant will break down the original questio
 For each sub-question, **the Assistant can perform searching** for uncertain knowledge using the format: "<|begin_of_query|> keyword1\tkeyword2\t... <|end_of_query|>".
 **The query must consist of straightforward and essential keywords separated by "\t"**. Furthermore, **the query must involve only a single triple to address a sub-question**.
 Then, the search system will provide the Assistant with relevant information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".
-When confident, reply with: "Final Answer: <answer>" only.
 
 User:{question}
 Assistant: <think>"""
@@ -555,13 +604,13 @@ The Assistant first thinks about the reasoning process in the mind and then prov
 The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here </answer>".
 During the thinking process, **the Assistant can perform searching** for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only list keywords separated by "\t" instead of the complete sentence , such as **"keyword_1 \t keyword_2 \t..."**)<|end_of_query|>". **A query must involve only a single triple**.
 Then, the search system will provide the Assistant with the retrieval information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".
-When confident, reply with: "Final Answer: <answer>" only.
 
 User:{question}
 Assistant: <think>"""
 
+
         elif prompt_type == 'v3':
-            return """The User asks a **Judgment question**, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer. The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here (yes or no) </answer>". During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only keywords) here <|end_of_query|>". Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>". The final answer **must be yes or no**.
+            return """The User asks a **Judgment question**, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer. The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here (yes or no) </answer>". During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<search> search query (only keywords) here </search>". Then, the system will provide the Assistant with helpful information with the format of "<information> ...search results... </information>". The final answer **must be yes or no**.
 When confident, reply with: "Final Answer: <answer>" only.\n\nUser:{question}\nAssistant: <think>"""
 
     def generate(self, contexts: List[str]) -> List[str]:
@@ -590,6 +639,7 @@ When confident, reply with: "Final Answer: <answer>" only.\n\nUser:{question}\nA
                 attention_mask=attention_mask,
                 do_sample=True,
                 temperature=self.temperature,
+                stopping_criteria=self.stopping_criteria,
                 top_p=self.top_p,
                 max_new_tokens=self.max_tokens or 512,
                 pad_token_id=self.tokenizer.eos_token_id,
