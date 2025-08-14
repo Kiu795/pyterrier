@@ -122,31 +122,66 @@ class AgenticRAG(pt.Transformer):
             assert len(batch_answers) == len(state_active_queries)
             pending_queries : List[Dict[str,Any]] = []
 
-            for i, answer in enumerate(batch_answers):
-                # print(i)
-                this_query_state = state_active_queries[i]
-                this_query_state['output'] += outputs[i]
-                next_search = self.get_search_query(outputs[i])
+            # for i, answer in enumerate(batch_answers):
+            #     # print(i)
+            #     this_query_state = state_active_queries[i]
+            #     this_query_state['output'] += outputs[i]
+            #     next_search = self.get_search_query(outputs[i])
 
-                if answer != "no answer found":
-                    this_query_state['qanswer'] = answer
-                    this_query_state['stop_reason'] = 'Got answer'
-                    state_finished_queries.append(this_query_state)
+            #     if answer != "no answer found":
+            #         this_query_state['qanswer'] = answer
+            #         this_query_state['stop_reason'] = 'Got answer'
+            #         state_finished_queries.append(this_query_state)
                     
 
-                else:
-                    if not next_search:
-                        # todo - use the output as the backup answer?
-                        this_query_state['stop_reason'] = 'No answer, no search'
-                        state_finished_queries.append(this_query_state)
-                        continue
+            #     else:
+            #         if not next_search:
+            #             # todo - use the output as the backup answer?
+            #             this_query_state['stop_reason'] = 'No answer, no search'
+            #             state_finished_queries.append(this_query_state)
+            #             continue
 
-                    else:
+            #         else:
                         
-                        this_query_state['search_history'].append(next_search)  # 提取检索query
-                        this_query_state['search_iterations'] += 1  
-                        pending_queries.append(this_query_state)
+            #             this_query_state['search_history'].append(next_search)  # 提取检索query
+            #             this_query_state['search_iterations'] += 1  
+            #             pending_queries.append(this_query_state)
+            for i, answer in enumerate(batch_answers):
+                this_query_state = state_active_queries[i]
+                this_query_state['output'] += outputs[i]
 
+                # 1) 严格判定是否已经有答案（避免误判首句为答案）
+                ans = self.format_answers(outputs[i], strict=True)
+                if ans != "no answer found":
+                    this_query_state['qanswer'] = ans
+                    this_query_state['stop_reason'] = 'Got answer'
+                    state_finished_queries.append(this_query_state)
+                    continue
+
+                # 2) 抽取搜索词；没有就结束本条，避免空转
+                next_search = self.get_search_query(outputs[i])
+                if not next_search:
+                    this_query_state['stop_reason'] = 'No answer, no search'
+                    state_finished_queries.append(this_query_state)
+                    continue
+
+                # 3) 去重：如果与上一轮搜索相同，就结束（或你也可以选择跳过递增但继续生成）
+                if this_query_state['search_history'] and \
+                next_search.strip() == this_query_state['search_history'][-1]:
+                    this_query_state['stop_reason'] = 'Duplicate search query'
+                    state_finished_queries.append(this_query_state)
+                    continue
+
+                # 4) 每条 query 的搜索总上限，避免无限回合
+                if this_query_state['search_iterations'] >= getattr(self, "max_search_per_query", 4):
+                    this_query_state['stop_reason'] = 'Search limit reached'
+                    state_finished_queries.append(this_query_state)
+                    continue
+
+                # 记录并进入下一阶段检索
+                this_query_state['search_history'].append(next_search)
+                this_query_state['search_iterations'] += 1
+                pending_queries.append(this_query_state)
             state_active_queries = pending_queries
 
             if len(pending_queries) == 0:
