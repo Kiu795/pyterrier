@@ -113,6 +113,7 @@ class AgenticRAG(pt.Transformer):
             batch_answers = self.check_answers(outputs)  # List[answer or None]
             pending_queries = []
             pending_search_str = []
+            pending_outputs = []
             for i, answer in enumerate(batch_answers):
                 if answer is not None:
                     finished_query = state_active_queries[i]
@@ -123,6 +124,7 @@ class AgenticRAG(pt.Transformer):
                 #如果还没有答案，则需要检索。
                     pending_queries.append(state_active_queries[i])
                     pending_search_str.append(self.get_search_query(outputs[i]))  # 提取检索query
+                    pending_outputs.append(outputs[i])
 
             #3. check for retrieve requirements in each of the outputs
             # build up BATCH of queries (df) to execute
@@ -132,9 +134,10 @@ class AgenticRAG(pt.Transformer):
             for i, q in enumerate(pending_queries):
                 s = pending_search_str[i]
                 if s is None:
-                    # 标记为异常，直接结束
-                    q['qanswer'] = None
-                    q['output'] = None
+                    # 无检索标签但有文本输出时，将原文作为候选答案保留
+                    original_output = pending_outputs[i] if i < len(pending_outputs) else None
+                    q['output'] = original_output
+                    q['qanswer'] = original_output
                     state_finished_queries.append(q)
                 else:
                     next_pending_queries.append(q)
@@ -278,30 +281,53 @@ class AgenticRAG(pt.Transformer):
 
     # 格式化检索结果
     def format_answers(self, output: str) -> str:
-
+        # 1) 显式 <answer> 标签
         match = re.search(r"<answer>(.*?)</answer>", output, re.DOTALL)
         if match:
             answer = match.group(1).strip()
             if answer:
                 return answer
 
-        match = re.search(r"\\boxed\{(.*)\}", output)
+        # 2) LaTeX 风格 \\boxed{...}（可含 \\text{...}）
+        match = re.search(r"\\boxed\{(.*)\}", output, re.DOTALL)
         if match:
             answer = match.group(1).strip()
             if answer:
-                # 进一步提取 \text{...} 结构
-                inner_match = re.search(r"\\text\{(.*)\}", answer)
+                inner_match = re.search(r"\\text\{(.*)\}", answer, re.DOTALL)
                 if inner_match:
-                    return inner_match.group(1).strip("()")
+                    return inner_match.group(1).strip("() ")
                 return answer
 
+        # 3) 英/中 Final Answer/答案 提示样式（大小写、空格、冒号兼容）
+        patterns = [
+            r"(?i)final\s*answer\s*[:：]\s*(.+)",
+            r"(?i)answer\s*[:：]\s*(.+)",
+            r"(?:最终答案|答案)\s*[:：]\s*(.+)",
+        ]
+        for p in patterns:
+            m = re.search(p, output, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate:
+                    sentence = re.split(r"[\n。!?\.]", candidate, maxsplit=1)[0].strip()
+                    if sentence:
+                        return sentence
+
+        # 4) 有思考标签时，取 </think> 之后首句作为兜底
         if "</think>" in output:
             after_think = output.split("</think>", 1)[1].strip()
             if after_think:
-                return after_think
+                sentence = re.split(r"[\n。!?\.]", after_think, maxsplit=1)[0].strip()
+                if sentence:
+                    return sentence
 
-        #其它自定义格式
-        # if ...
+        # 5) 纯文本兜底：取首个非空行/首句
+        clean = (output or "").strip()
+        if clean:
+            sentence = re.split(r"[\n。!?\.]", clean, maxsplit=1)[0].strip()
+            if sentence:
+                return sentence
+
         return "no answer found"
 
     #终止条件，子类实现
@@ -311,6 +337,14 @@ class AgenticRAG(pt.Transformer):
             return True
         
         if re.search(r"\\boxed\{.*?\}", output):
+            return True
+
+        # Final Answer/答案 样式
+        if re.search(r"(?i)final\s*answer\s*[:]", output):
+            return True
+        if re.search(r"(?i)\banswer\s*[:]", output):
+            return True
+        if re.search(r"(最终答案|答案)\s*[:]", output):
             return True
 
         return False
@@ -499,7 +533,8 @@ class R1Searcher(AgenticRAG):
 The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer.
 The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here </answer>".
 During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only keywords) here <|end_of_query|>". **A query must involve only a single triple**.
-Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".\n\nUser:{question}\nAssistant: <think>"""
+Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".
+When confident, reply with: "Final Answer: <answer>" only.\n\nUser:{question}\nAssistant: <think>"""
 
         elif prompt_type == 'v1':
             return """The User asks a question, and the Assistant solves it.
@@ -509,6 +544,7 @@ During the reasoning process, the Assistant will break down the original questio
 For each sub-question, **the Assistant can perform searching** for uncertain knowledge using the format: "<|begin_of_query|> keyword1\tkeyword2\t... <|end_of_query|>".
 **The query must consist of straightforward and essential keywords separated by "\t"**. Furthermore, **the query must involve only a single triple to address a sub-question**.
 Then, the search system will provide the Assistant with relevant information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".
+When confident, reply with: "Final Answer: <answer>" only.
 
 User:{question}
 Assistant: <think>"""
@@ -519,12 +555,14 @@ The Assistant first thinks about the reasoning process in the mind and then prov
 The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here </answer>".
 During the thinking process, **the Assistant can perform searching** for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only list keywords separated by "\t" instead of the complete sentence , such as **"keyword_1 \t keyword_2 \t..."**)<|end_of_query|>". **A query must involve only a single triple**.
 Then, the search system will provide the Assistant with the retrieval information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".
+When confident, reply with: "Final Answer: <answer>" only.
 
 User:{question}
 Assistant: <think>"""
 
         elif prompt_type == 'v3':
-            return """The User asks a **Judgment question**, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer. The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here (yes or no) </answer>". During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only keywords) here <|end_of_query|>". Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>". The final answer **must be yes or no**.\n\nUser:{question}\nAssistant: <think>"""
+            return """The User asks a **Judgment question**, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer. The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here (yes or no) </answer>". During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only keywords) here <|end_of_query|>". Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>". The final answer **must be yes or no**.
+When confident, reply with: "Final Answer: <answer>" only.\n\nUser:{question}\nAssistant: <think>"""
 
     def generate(self, contexts: List[str]) -> List[str]:
         # vLLM 后端：原生支持批量
