@@ -122,30 +122,6 @@ class AgenticRAG(pt.Transformer):
             assert len(batch_answers) == len(state_active_queries)
             pending_queries : List[Dict[str,Any]] = []
 
-            # for i, answer in enumerate(batch_answers):
-            #     # print(i)
-            #     this_query_state = state_active_queries[i]
-            #     this_query_state['output'] += outputs[i]
-            #     next_search = self.get_search_query(outputs[i])
-
-            #     if answer != "no answer found":
-            #         this_query_state['qanswer'] = answer
-            #         this_query_state['stop_reason'] = 'Got answer'
-            #         state_finished_queries.append(this_query_state)
-                    
-
-            #     else:
-            #         if not next_search:
-            #             # todo - use the output as the backup answer?
-            #             this_query_state['stop_reason'] = 'No answer, no search'
-            #             state_finished_queries.append(this_query_state)
-            #             continue
-
-            #         else:
-                        
-            #             this_query_state['search_history'].append(next_search)  # 提取检索query
-            #             this_query_state['search_iterations'] += 1  
-            #             pending_queries.append(this_query_state)
             for i, answer in enumerate(batch_answers):
                 this_query_state = state_active_queries[i]
                 this_query_state['output'] += outputs[i]
@@ -162,19 +138,6 @@ class AgenticRAG(pt.Transformer):
                 next_search = self.get_search_query(outputs[i])
                 if not next_search:
                     this_query_state['stop_reason'] = 'No answer, no search'
-                    state_finished_queries.append(this_query_state)
-                    continue
-
-                # 3) 去重：如果与上一轮搜索相同，就结束（或你也可以选择跳过递增但继续生成）
-                if this_query_state['search_history'] and \
-                next_search.strip() == this_query_state['search_history'][-1]:
-                    this_query_state['stop_reason'] = 'Duplicate search query'
-                    state_finished_queries.append(this_query_state)
-                    continue
-
-                # 4) 每条 query 的搜索总上限，避免无限回合
-                if this_query_state['search_iterations'] >= getattr(self, "max_search_per_query", 4):
-                    this_query_state['stop_reason'] = 'Search limit reached'
                     state_finished_queries.append(this_query_state)
                     continue
 
@@ -215,9 +178,12 @@ class AgenticRAG(pt.Transformer):
 
             state_active_queries = next_state_active_queries
 
-            # # any still active queries must have had no answer after self.max_turns    
+        # any still active queries must have had no answer after self.max_turns    
+        if state_active_queries:
             for q in state_active_queries:
-                q["stop_reason"] = 'No answer after max turns'
+                if not q.get("stop_reason"):
+                    q["stop_reason"] = "No answer after max turns"
+
 
         # 7. 合并所有已完成的和剩余未完成的
         # combine state_finished into results_df, and anything left in state_active that
@@ -420,7 +386,7 @@ class SearchR1(AgenticRAG):
         retriever,
         generator = None,
         temperature = 0.7,
-        top_k = 5,
+        top_k = 8,
         max_turn = 10,
         max_tokens = 512,
         model_id = "PeterJinGo/SearchR1-nq_hotpotqa_train-qwen2.5-7b-em-ppo",
@@ -526,7 +492,7 @@ class R1Searcher(AgenticRAG):
              retriever,
              generator=None,
              temperature=0.7,
-             top_k=5,
+             top_k=8,
              top_p=0.95,
              max_turn=6,
              max_tokens=512,
@@ -560,12 +526,7 @@ class R1Searcher(AgenticRAG):
 
         # 基础配置与提示/标记
         # 与 R1Searcher 的查询标签一致（而非 </search>）
-        self.target_sequences = [
-            self.end_search_tag,   
-            " " + self.end_search_tag,         # 前面可能带空格
-            self.end_search_tag + "\n",
-            self.end_search_tag + "\n\n"
-        ]
+        self.target_sequences = ["<|end_of_query|>", " <|end_of_query|>", "<|end_of_query|>\n", " <|end_of_query|>\n", "<|end_of_query|>\n\n", " <|end_of_query|>\n\n"]
 
         # —— 优先尝试 vLLM（更快），失败自动回退 ——
         if use_vllm and _VLLM_OK:
@@ -623,15 +584,29 @@ Then, the system will provide the Assistant with helpful information with the fo
 
         elif prompt_type == 'v1':
             return """The User asks a question, and the Assistant solves it.
-The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer.
-The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here </answer>".
-During the reasoning process, the Assistant will break down the original question into sub-questions and address them step by step.
-For each sub-question, **the Assistant can perform searching** for uncertain knowledge using the format: "<|begin_of_query|> keyword1\tkeyword2\t... <|end_of_query|>".
-**The query must consist of straightforward and essential keywords separated by "\t"**. Furthermore, **the query must involve only a single triple to address a sub-question**.
-Then, the search system will provide the Assistant with relevant information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>".
+Use these tags ONLY: <think>...</think>, <|begin_of_query|>...<|end_of_query|>, <|begin_of_documents|>...<|end_of_documents|>, <answer>...</answer>.
+General protocol:
+1) Inside <think>, decompose the question if needed and decide what information is missing.
+2) When external knowledge is needed, output EXACTLY one line:
+   <|begin_of_query|> keyword1\tkeyword2\t... <|end_of_query|>
+   - Include the core entity/subject and the essential property/constraint keywords.
+   - Add common aliases/synonyms (English and/or Chinese) when helpful.
+   - Immediately STOP after <|end_of_query|>. Do NOT output anything else until <|begin_of_documents|> is provided.
+3) After I return <|begin_of_documents|> ... <|end_of_documents|>, resume <think> to extract the needed facts:
+   - Prefer explicit statements that directly support the requirement.
+   - If evidence is insufficient or off-topic, refine keywords and SEARCH again.
+4) Only when there is clear supporting evidence in <|begin_of_documents|> ... <|end_of_documents|>, output:
+   <answer> final answer here </answer>
 
+Output rules:
+- Keep <think> concise; do not reveal chain-of-thought beyond the tag.
+- Do NOT output <answer> until evidence from <|begin_of_documents|> is found.
+- If still uncertain after several searches, continue searching; do not guess.
+- Do NOT output <answer> until a clear supporting statement is found in <|begin_of_documents|>.
+- If the retrieved information does not directly answer the question, refine the keywords and <|begin_of_query|>...<|end_of_query|> again.
 User:{question}
-Assistant: <think>"""
+Assistant: <think>
+"""
 
         elif prompt_type == 'v2':
             return """The User asks a question, and the Assistant solves it.
@@ -645,8 +620,8 @@ Assistant: <think>"""
 
 
         elif prompt_type == 'v3':
-            return """The User asks a **Judgment question**, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer. The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here (yes or no) </answer>". During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<search> search query (only keywords) here </search>". Then, the system will provide the Assistant with helpful information with the format of "<information> ...search results... </information>". The final answer **must be yes or no**.
-When confident, reply with: "Final Answer: <answer>" only.\n\nUser:{question}\nAssistant: <think>"""
+            return """The User asks a **Judgment question**, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the final answer. The output format of reasoning process and final answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "<think> reasoning process here </think>\n\n<answer> final answer here (yes or no) </answer>". During the thinking process, the Assistant can perform searching for uncertain knowledge if necessary with the format of "<|begin_of_query|> search query (only keywords) here <|end_of_query|>". Then, the system will provide the Assistant with helpful information with the format of "<|begin_of_documents|> ...search results... <|end_of_documents|>". The final answer **must be yes or no**.\n\nUser:{question}\nAssistant: <think>"""
+
 
     def generate(self, contexts: List[str]) -> List[str]:
         # vLLM 后端：原生支持批量
