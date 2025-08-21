@@ -491,7 +491,7 @@ class R1Searcher(AgenticRAG):
     def __init__(self, 
              retriever,
              generator=None,
-             temperature=0.7,
+             temperature=0.3,
              top_k=8,
              top_p=0.95,
              max_turn=6,
@@ -533,7 +533,7 @@ class R1Searcher(AgenticRAG):
             try:
                 # 多进程与日志的稳态设置（notebook/本地更稳）
                 os.environ.setdefault("VLLM_WORKER_MULTIPROCESSING_METHOD", "spawn")
-                os.environ.setdefault("VLLM_USE_V1", "0")      # 如需 v1 再改回 "1"
+                os.environ.setdefault("VLLM_USE_V1", "1")      # 如需 v1 再改回 "1"
                 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 
                 mk = dict(
@@ -541,8 +541,8 @@ class R1Searcher(AgenticRAG):
                     hf_token=self.hf_token,
                     dtype="bfloat16",                 # 或 "float16"
                     tensor_parallel_size=1,
-                    gpu_memory_utilization=0.65,      # 降预分配，减少 Engine 启动失败
-                    max_model_len=2048,               # 降 KV cache 预分配
+                    gpu_memory_utilization=0.95,      # 降预分配，减少 Engine 启动失败
+                    max_model_len=5096,               # 降 KV cache 预分配
                     enforce_eager=True,               # 初始化更稳
                 )
                 if model_kw_args:
@@ -550,8 +550,11 @@ class R1Searcher(AgenticRAG):
 
                 self.llm = LLM(model=self.model_id, **mk)
                 self.sampling_params = SamplingParams(
-                    temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+                    temperature=self.temperature, top_p=self.top_p, max_tokens=self.max_tokens,
                     stop = ["<|im_end|>", self.end_search_tag, "<|endoftext|>", "</answer>"]
+                    #stop = ["<|im_end|>", "<|endoftext|>"]
+                    
+                    # stop = self.target_sequences
                 )
                 self._backend = "vllm"
                 if self.verbose:
@@ -627,6 +630,11 @@ Assistant: <think>"""
         # vLLM 后端：原生支持批量
         if self._backend == "vllm":
             outputs = self.llm.generate(contexts, self.sampling_params, use_tqdm=self.verbose)
+            # which of the following start tags was the last to be seen - if begin_query, then add end_of query etc
+            # texts = []
+            # for o in outputs:
+            #     g = o.outputs.[0]
+            #     # TODO
             return [o.outputs[0].text for o in outputs]
 
         # transformers 回退：批量 tokenize 与生成
@@ -651,7 +659,7 @@ Assistant: <think>"""
                 temperature=self.temperature,
                 stopping_criteria=self.stopping_criteria,
                 top_p=self.top_p,
-                max_new_tokens=self.max_tokens or 512,
+                max_new_tokens=self.max_tokens or 1024,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
