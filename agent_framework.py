@@ -542,7 +542,7 @@ class R1Searcher(AgenticRAG):
                     dtype="bfloat16",                 # 或 "float16"
                     tensor_parallel_size=1,
                     gpu_memory_utilization=0.95,      # 降预分配，减少 Engine 启动失败
-                    max_model_len=5096,               # 降 KV cache 预分配
+                    max_model_len=1024,               # 降 KV cache 预分配
                     enforce_eager=True,               # 初始化更稳
                 )
                 if model_kw_args:
@@ -629,13 +629,26 @@ Assistant: <think>"""
     def generate(self, contexts: List[str]) -> List[str]:
         # vLLM 后端：原生支持批量
         if self._backend == "vllm":
-            outputs = self.llm.generate(contexts, self.sampling_params, use_tqdm=self.verbose)
-            # which of the following start tags was the last to be seen - if begin_query, then add end_of query etc
-            # texts = []
-            # for o in outputs:
-            #     g = o.outputs.[0]
-            #     # TODO
-            return [o.outputs[0].text for o in outputs]
+            results = self.llm.generate(contexts, self.sampling_params, use_tqdm=self.verbose)
+            texts: List[str] = []
+            for r in results:
+                first = r.outputs[0] if getattr(r, "outputs", None) else None
+                generated_text = getattr(first, "text", "") if first else ""
+
+                normalized = generated_text or ""
+                last_begin_query = normalized.rfind("<|begin_of_query|>")
+                last_answer = normalized.rfind("<answer>")
+
+                if last_begin_query != -1 and (last_answer == -1 or last_begin_query > last_answer):
+                    if normalized.rfind("<|end_of_query|>", last_begin_query) == -1:
+                        normalized = normalized.rstrip() + " <|end_of_query|>"
+                elif last_answer != -1:
+                    if normalized.rfind("</answer>", last_answer) == -1:
+                        normalized = normalized.rstrip() + " </answer>"
+
+                texts.append(normalized)
+
+            return texts
 
         # transformers 回退：批量 tokenize 与生成
         assert self.tokenizer is not None and self.device is not None, "HF backend not initialized"
