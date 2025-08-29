@@ -1,0 +1,2 @@
+name,num_queries,Total_s,MRT_s,Avg_Turns,GPU_GB_peak_overall,created_csv
+HF-7B (sequential),100,516.42,5.1642,1.19,15.139,/mnt/primary/pyterrier/tests/eff_HF-7B (sequential)_perq.csv
